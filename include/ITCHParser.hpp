@@ -10,10 +10,10 @@
 #include <unistd.h>
 #include <iostream>
 #include <vector>
-#include <unordered_map>
 #include <string>
 #include <cstring>
 #include <iomanip>
+#include <memory_resource>
 
 namespace itch {
 
@@ -22,8 +22,8 @@ private:
     // 1. Define 4 GB buffer size (1024 * 1024 * 1024 bytes)
     static constexpr size_t POOL_SIZE = 4ULL * 1024 * 1024 * 1024;
 
-    // Allocate 4 GB on heap via unique_ptr to avoid overflowing executable stack
-    std::unique_ptr<char[]> arena_buffer_;
+    // Raw pointer for the mmap arena
+    void* arena_buffer_;
 
     // PMR Monotonic Buffer Resource wrapping the 4 GB arena
     std::pmr::monotonic_buffer_resource pool_;
@@ -31,9 +31,8 @@ private:
     // Order books indexed by locate ID (0..15000)
     std::vector<OrderBook> order_books_;
 
-    // Lookup table: Ticker Symbol -> Stock Locate ID
-    std::unordered_map<std::string, uint16_t> symbol_to_locate_;
-    std::unordered_map<uint16_t, std::string> locate_to_symbol_;
+    // Lookup table
+    std::vector<std::string> locate_to_symbol_;
     
     uint64_t total_messages_{0};
     uint64_t add_orders_{0};
@@ -41,14 +40,32 @@ private:
     uint64_t cancelled_orders_{0};
     uint64_t replaced_orders_{0};
 
+    // Helper to allocate large memory chunk using huge pages with a fallback
+    static void* allocate_arena(size_t size) {
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        
+        // Attempt allocation with huge pages to reduce TLB misses
+#if defined(MAP_HUGETLB)
+        void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags | MAP_HUGETLB, -1, 0);
+        if (ptr != MAP_FAILED) {
+            return ptr;
+        }
+#endif
+        // Fallback to standard 4KB pages if huge pages aren't configured in the OS
+        void* fallback = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (fallback == MAP_FAILED) {
+            throw std::bad_alloc();
+        }
+        return fallback;
+    }
+
     // Parse 6-byte big-endian timestamp starting at byte index 5 (nanoseconds since midnight)
     static uint64_t parse_itch_timestamp(const uint8_t* ptr) {
-        return (static_cast<uint64_t>(ptr[0]) << 40) |
-               (static_cast<uint64_t>(ptr[1]) << 32) |
-               (static_cast<uint64_t>(ptr[2]) << 24) |
-               (static_cast<uint64_t>(ptr[3]) << 16) |
-               (static_cast<uint64_t>(ptr[4]) << 8)  |
-                static_cast<uint64_t>(ptr[5]);
+        uint64_t raw;
+        // Compilers optimize this into a single 64-bit load (movq)
+        std::memcpy(&raw, ptr, sizeof(raw)); 
+        // Swap bytes and drop the extra 2 bytes
+        return __builtin_bswap64(raw) >> 16; 
     }
 
     // Format raw nanoseconds since midnight into HH:MM:SS.nanoseconds
@@ -69,7 +86,7 @@ private:
         return ss.str();
     }
 
-    // Print active order book snapshot for watchlist tickers
+    // Print active order book snapshot for manual locate IDs
     void print_order_book_snapshot(const std::string& label) const {
         std::cout << "\n\n===================================================================\n";
         std::cout << "          ORDER BOOK SNAPSHOT: " << label << "\n";
@@ -82,17 +99,18 @@ private:
                   << std::setw(14) << "BEST ASK" << "\n";
         std::cout << "-------------------------------------------------------------------\n";
 
-        static const std::vector<std::string> watchlist = {
-            "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "QQQ", "SPY"
+        // Hardcoded random locate IDs as requested
+        static const std::vector<uint16_t> watchlist_ids = {
+            1, 2, 5, 10, 25, 50, 100, 500
         };
 
-        for (const auto& sym : watchlist) {
-            uint16_t locate = get_locate_by_symbol(sym);
-            if (locate == 0) continue;
+        for (uint16_t locate : watchlist_ids) {
+            if (locate >= order_books_.size()) continue;
 
             const auto& book = get_order_book(locate);
             uint64_t active_orders = book.get_order_count();
             
+            std::string sym = get_symbol_by_locate(locate);
             std::string bid_str = (book.best_bid() > 0) ? std::to_string(book.best_bid() / 10000.0) : "N/A";
             std::string ask_str = (book.best_ask() > 0) ? std::to_string(book.best_ask() / 10000.0) : "N/A";
 
@@ -108,16 +126,21 @@ private:
 
 public:
     explicit ITCHParser(size_t max_locates = 15000)
-        : arena_buffer_(std::make_unique<char[]>(POOL_SIZE)),
-          // Initialize pool with arena_buffer_.
-          // std::pmr::null_memory_resource() causes throw on depletion instead of silent heap fallback.
-          pool_(arena_buffer_.get(), POOL_SIZE, std::pmr::null_memory_resource()) {
+        : arena_buffer_(allocate_arena(POOL_SIZE)),
+          pool_(arena_buffer_, POOL_SIZE, std::pmr::null_memory_resource()) {
         
         order_books_.reserve(max_locates);
-        
+        locate_to_symbol_.resize(max_locates);
+
         // Construct each OrderBook explicitly with a pointer to our PMR pool
         for (size_t i = 0; i < max_locates; ++i) {
             order_books_.emplace_back(&pool_);
+        }
+    }
+
+    ~ITCHParser() {
+        if (arena_buffer_ && arena_buffer_ != MAP_FAILED) {
+            munmap(arena_buffer_, POOL_SIZE);
         }
     }
 
@@ -149,6 +172,7 @@ public:
         #endif
 
         size_t offset = 0;
+        uint32_t progress_counter = 10'000'000; // Counter moved outside loop
 
         // NASDAQ ITCH binary file format uses 2-byte big-endian framing per message
         while (offset + 2 < filesize) {
@@ -162,7 +186,99 @@ public:
             char msg_type = static_cast<char>(msg_ptr[0]);
 
             switch (msg_type) {
-                case 'S': { // System Event Message
+                case 'A': [[likely]] { // Add Order (Short Form)
+                    AddOrderMessage add_msg;
+                    std::memcpy(&add_msg, msg_ptr, sizeof(AddOrderMessage));
+                    
+                    uint16_t locate = bswap16(add_msg.header.stock_locate);
+                    uint64_t order_id = bswap64(add_msg.order_reference_number);
+                    uint32_t shares = bswap32(add_msg.shares);
+                    uint32_t price = bswap32(add_msg.price);
+
+                    order_books_[locate].add_order(order_id, price, shares, add_msg.buy_sell_indicator);
+                    add_orders_++;
+                    break;
+                }
+                case 'F': [[likely]] { // Add Order with MPID (Long Form)
+                    AddOrderMessage add_msg; // Structure matches AddOrder short of MPID padding for critical fields
+                    std::memcpy(&add_msg, msg_ptr, sizeof(AddOrderMessage));
+                    
+                    uint16_t locate = bswap16(add_msg.header.stock_locate);
+                    uint64_t order_id = bswap64(add_msg.order_reference_number);
+                    uint32_t shares = bswap32(add_msg.shares);
+                    uint32_t price = bswap32(add_msg.price);
+
+                    order_books_[locate].add_order(order_id, price, shares, add_msg.buy_sell_indicator);
+                    add_orders_++;
+                    break;
+                }
+                case 'E': [[likely]]   // Order Executed
+                case 'C': [[likely]] { // Order Executed with Price
+                    OrderExecutedMessage exec_msg;
+                    std::memcpy(&exec_msg, msg_ptr, sizeof(OrderExecutedMessage));
+                    
+                    uint16_t locate = bswap16(exec_msg.header.stock_locate);
+                    uint64_t order_id = bswap64(exec_msg.order_reference_number);
+                    uint32_t exec_shares = bswap32(exec_msg.executed_shares);
+
+                    order_books_[locate].execute_order(order_id, exec_shares);
+                    executed_orders_++;
+                    break;
+                }
+                case 'X': [[likely]] { // Order Cancel
+                    OrderCancelMessage cancel_msg;
+                    std::memcpy(&cancel_msg, msg_ptr, sizeof(OrderCancelMessage));
+                    
+                    uint16_t locate = bswap16(cancel_msg.header.stock_locate);
+                    uint64_t order_id = bswap64(cancel_msg.order_reference_number);
+                    uint32_t cancel_shares = bswap32(cancel_msg.canceled_shares);
+
+                    order_books_[locate].cancel_order(order_id, cancel_shares);
+                    cancelled_orders_++;
+                    break;
+                }
+                case 'D': [[likely]] { // Order Delete
+                    OrderDeleteMessage del_msg;
+                    std::memcpy(&del_msg, msg_ptr, sizeof(OrderDeleteMessage));
+                    
+                    uint16_t locate = bswap16(del_msg.header.stock_locate);
+                    uint64_t order_id = bswap64(del_msg.order_reference_number);
+
+                    order_books_[locate].delete_order(order_id);
+                    cancelled_orders_++;
+                    break;
+                }
+                case 'U': [[likely]] { // Order Replace
+                    OrderReplaceMessage rep_msg;
+                    std::memcpy(&rep_msg, msg_ptr, sizeof(OrderReplaceMessage));
+                    
+                    uint16_t locate = bswap16(rep_msg.header.stock_locate);
+                    uint64_t old_id = bswap64(rep_msg.original_order_reference_number);
+                    uint64_t new_id = bswap64(rep_msg.new_order_reference_number);
+                    uint32_t shares = bswap32(rep_msg.shares);
+                    uint32_t price = bswap32(rep_msg.price);
+
+                    order_books_[locate].replace_order(old_id, new_id, price, shares);
+                    replaced_orders_++;
+                    break;
+                }
+                case 'R': [[unlikely]] { // Stock Directory (Maps Locate ID to Symbol string)
+                    if (msg_len >= 29) {
+                        uint16_t locate = (static_cast<uint16_t>(msg_ptr[1]) << 8) | msg_ptr[2];
+                        char sym_buf[9] = {0};
+                        std::memcpy(sym_buf, msg_ptr + 11, 8);
+                        
+                        // Trim trailing spaces
+                        std::string symbol(sym_buf);
+                        symbol.erase(symbol.find_last_not_of(" \n\r\t") + 1);
+
+                        if (locate < locate_to_symbol_.size()) {
+                            locate_to_symbol_[locate] = symbol;
+                        }
+                    }
+                    break;
+                }
+                case 'S': [[unlikely]] { // System Event Message
                     if (msg_len >= 12) {
                         uint64_t raw_nanos = parse_itch_timestamp(msg_ptr + 5);
                         char event_code = static_cast<char>(msg_ptr[11]);
@@ -186,93 +302,15 @@ public:
                     }
                     break;
                 }
-                case 'R': { // Stock Directory (Maps Locate ID to Symbol string)
-                    if (msg_len >= 29) {
-                        uint16_t locate = (static_cast<uint16_t>(msg_ptr[1]) << 8) | msg_ptr[2];
-                        char sym_buf[9] = {0};
-                        std::memcpy(sym_buf, msg_ptr + 11, 8);
-                        
-                        // Trim trailing spaces
-                        std::string symbol(sym_buf);
-                        symbol.erase(symbol.find_last_not_of(" \n\r\t") + 1);
-
-                        symbol_to_locate_[symbol] = locate;
-                        locate_to_symbol_[locate] = symbol;
-                    }
-                    break;
-                }
-                case 'A': { // Add Order (Short Form)
-                    const auto* add_msg = reinterpret_cast<const AddOrderMessage*>(msg_ptr);
-                    uint16_t locate = bswap16(add_msg->header.stock_locate);
-                    uint64_t order_id = bswap64(add_msg->order_reference_number);
-                    uint32_t shares = bswap32(add_msg->shares);
-                    uint32_t price = bswap32(add_msg->price);
-
-                    order_books_[locate].add_order(order_id, price, shares, add_msg->buy_sell_indicator);
-                    add_orders_++;
-                    break;
-                }
-                case 'F': { // Add Order with MPID (Long Form)
-                    const auto* add_msg = reinterpret_cast<const AddOrderMessage*>(msg_ptr);
-                    uint16_t locate = bswap16(add_msg->header.stock_locate);
-                    uint64_t order_id = bswap64(add_msg->order_reference_number);
-                    uint32_t shares = bswap32(add_msg->shares);
-                    uint32_t price = bswap32(add_msg->price);
-
-                    order_books_[locate].add_order(order_id, price, shares, add_msg->buy_sell_indicator);
-                    add_orders_++;
-                    break;
-                }
-                case 'E':   // Order Executed
-                case 'C': { // Order Executed with Price
-                    const auto* exec_msg = reinterpret_cast<const OrderExecutedMessage*>(msg_ptr);
-                    uint16_t locate = bswap16(exec_msg->header.stock_locate);
-                    uint64_t order_id = bswap64(exec_msg->order_reference_number);
-                    uint32_t exec_shares = bswap32(exec_msg->executed_shares);
-
-                    order_books_[locate].execute_order(order_id, exec_shares);
-                    executed_orders_++;
-                    break;
-                }
-                case 'X': { // Order Cancel
-                    const auto* cancel_msg = reinterpret_cast<const OrderCancelMessage*>(msg_ptr);
-                    uint16_t locate = bswap16(cancel_msg->header.stock_locate);
-                    uint64_t order_id = bswap64(cancel_msg->order_reference_number);
-                    uint32_t cancel_shares = bswap32(cancel_msg->canceled_shares);
-
-                    order_books_[locate].cancel_order(order_id, cancel_shares);
-                    cancelled_orders_++;
-                    break;
-                }
-                case 'D': { // Order Delete
-                    const auto* del_msg = reinterpret_cast<const OrderDeleteMessage*>(msg_ptr);
-                    uint16_t locate = bswap16(del_msg->header.stock_locate);
-                    uint64_t order_id = bswap64(del_msg->order_reference_number);
-
-                    order_books_[locate].delete_order(order_id);
-                    cancelled_orders_++;
-                    break;
-                }
-                case 'U': { // Order Replace
-                    const auto* rep_msg = reinterpret_cast<const OrderReplaceMessage*>(msg_ptr);
-                    uint16_t locate = bswap16(rep_msg->header.stock_locate);
-                    uint64_t old_id = bswap64(rep_msg->original_order_reference_number);
-                    uint64_t new_id = bswap64(rep_msg->new_order_reference_number);
-                    uint32_t shares = bswap32(rep_msg->shares);
-                    uint32_t price = bswap32(rep_msg->price);
-
-                    order_books_[locate].replace_order(old_id, new_id, price, shares);
-                    replaced_orders_++;
-                    break;
-                }
                 default:
                     break;
             }
 
             total_messages_++;
 
-            // Print progress line every 10,000,000 messages
-            if (total_messages_ % 10'000'000 == 0) {
+            // Progress reporting optimized out of modulo arithmetic
+            if (--progress_counter == 0) {
+                progress_counter = 10'000'000;
                 double pct = (static_cast<double>(offset) / filesize) * 100.0;
                 std::cout << "\r[Processing] " << (total_messages_ / 1'000'000) 
                           << "M messages | " << std::fixed << std::setprecision(1) 
@@ -290,23 +328,15 @@ public:
         return true;
     }
 
-    uint16_t get_locate_by_symbol(const std::string& symbol) const {
-        auto it = symbol_to_locate_.find(symbol);
-        return (it != symbol_to_locate_.end()) ? it->second : 0;
-    }
-
     std::string get_symbol_by_locate(uint16_t locate_id) const {
-        auto it = locate_to_symbol_.find(locate_id);
-        return (it != locate_to_symbol_.end()) ? it->second : "UNKNOWN";
+        if (locate_id < locate_to_symbol_.size() && !locate_to_symbol_[locate_id].empty()) {
+            return locate_to_symbol_[locate_id];
+        }
+        return "UNKNOWN";
     }
 
     const OrderBook& get_order_book(uint16_t locate_id) const noexcept {
         return order_books_[locate_id];
-    }
-
-    const OrderBook* get_order_book(const std::string& symbol) const {
-        uint16_t locate = get_locate_by_symbol(symbol);
-        return (locate != 0) ? &order_books_[locate] : nullptr;
     }
 
     [[nodiscard]] uint64_t total_messages() const noexcept { return total_messages_; }

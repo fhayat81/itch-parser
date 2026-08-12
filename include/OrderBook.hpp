@@ -1,4 +1,5 @@
 #pragma once
+
 #include <algorithm>
 #include <cstdint>
 #include <map>
@@ -7,7 +8,8 @@
 
 namespace itch {
 
-struct OrderMetaData {
+// Packed to fit cleanly into cache lines (16 bytes aligned)
+struct alignas(8) OrderMetaData {
     uint64_t order_id;
     uint32_t price;
     uint32_t shares;
@@ -19,36 +21,30 @@ struct PriceLevel {
     uint32_t order_count{0};
 };
 
-
-
 template <typename Key, typename Value, typename Compare = std::less<Key>>
-
 using PmrMap = std::map<Key, Value, Compare, std::pmr::polymorphic_allocator<std::pair<const Key, Value>>>;
 
 class OrderBook {
 private:
-
     PmrMap<uint32_t, PriceLevel, std::greater<uint32_t>> bids_;
     PmrMap<uint32_t, PriceLevel, std::less<uint32_t>> asks_;
     DenseMap<uint64_t, OrderMetaData> order_map_;
 
 public:
-
     explicit OrderBook(std::pmr::memory_resource* mr = std::pmr::get_default_resource())
         : bids_(mr),
           asks_(mr),
           order_map_(mr) {}
 
     OrderBook(const OrderBook&) = delete;
-
     OrderBook& operator=(const OrderBook&) = delete;
 
     OrderBook(OrderBook&&) noexcept = default;
-
     OrderBook& operator=(OrderBook&&) noexcept = default;
 
     inline void add_order(uint64_t order_id, uint32_t price, uint32_t shares, char side) noexcept {
         order_map_.insert(order_id, OrderMetaData{order_id, price, shares, side});
+        
         if (side == 'B') {
             auto& level = bids_[price];
             level.volume += shares;
@@ -62,11 +58,15 @@ public:
 
     inline void execute_order(uint64_t order_id, uint32_t executed_shares) noexcept {
         OrderMetaData* order = order_map_.find(order_id);
-        if (!order) return;
+        if (!order) [[unlikely]] return;
+
         uint32_t actual_exec = std::min(executed_shares, order->shares);
         order->shares -= actual_exec;
-        reduce_level(order->side, order->price, actual_exec);
-        if (order->shares == 0) {
+        
+        const bool fully_filled = (order->shares == 0);
+        reduce_level(order->side, order->price, actual_exec, fully_filled);
+
+        if (fully_filled) {
             order_map_.erase(order_id);
         }
     }
@@ -77,14 +77,17 @@ public:
 
     inline void delete_order(uint64_t order_id) noexcept {
         OrderMetaData* order = order_map_.find(order_id);
-        if (!order) return;
-        reduce_level(order->side, order->price, order->shares);
+        if (!order) [[unlikely]] return;
+
+        // Deleting an order always removes it fully from the price level
+        reduce_level(order->side, order->price, order->shares, true);
         order_map_.erase(order_id);
     }
 
     inline void replace_order(uint64_t old_order_id, uint64_t new_order_id, uint32_t new_price, uint32_t new_shares) noexcept {
         OrderMetaData* old_order = order_map_.find(old_order_id);
-        if (!old_order) return;
+        if (!old_order) [[unlikely]] return;
+
         char side = old_order->side;
         delete_order(old_order_id);
         add_order(new_order_id, new_price, new_shares, side);
@@ -103,27 +106,35 @@ public:
     }
 
 private:
-    inline void reduce_level(char side, uint32_t price, uint32_t qty) noexcept {
+    inline void reduce_level(char side, uint32_t price, uint32_t qty, bool fully_removed) noexcept {
         if (side == 'B') {
             auto it = bids_.find(price);
-            if (it != bids_.end()) {
-                if (it->second.volume > qty) {
+            if (it != bids_.end()) [[likely]] {
+                if (fully_removed && it->second.order_count > 0) {
+                    it->second.order_count--;
+                }
+                
+                if (it->second.volume > qty && it->second.order_count > 0) {
                     it->second.volume -= qty;
                 } else {
-                    bids_.erase(it);
+                    bids_.erase(it); // Erase price level when volume or order count hits 0
                 }
             }
         } else {
             auto it = asks_.find(price);
-            if (it != asks_.end()) {
-                if (it->second.volume > qty) {
+            if (it != asks_.end()) [[likely]] {
+                if (fully_removed && it->second.order_count > 0) {
+                    it->second.order_count--;
+                }
+
+                if (it->second.volume > qty && it->second.order_count > 0) {
                     it->second.volume -= qty;
                 } else {
-                    asks_.erase(it);
+                    asks_.erase(it); // Erase price level when volume or order count hits 0
                 }
             }
         }
     }
 };
 
-} //namespace itch
+} // namespace itch
