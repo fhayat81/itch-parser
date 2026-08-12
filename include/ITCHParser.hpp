@@ -28,30 +28,12 @@ private:
     // PMR Monotonic Buffer Resource wrapping the 4 GB arena
     std::pmr::monotonic_buffer_resource pool_;
 
-    // Order books indexed by locate ID (0..65535)
+    // Order books indexed by locate ID (0..15000)
     std::vector<OrderBook> order_books_;
 
     // Lookup table: Ticker Symbol -> Stock Locate ID
     std::unordered_map<std::string, uint16_t> symbol_to_locate_;
     std::unordered_map<uint16_t, std::string> locate_to_symbol_;
-
-    uint64_t count_inside {0};
-    uint64_t count_outside {0};
-
-    uint32_t minPrice {2147483647};
-    uint32_t maxPrice {0};
-
-    inline void check(uint32_t x){
-        // if(x < minPrice) minPrice = x;
-        // if(x > maxPrice) maxPrice = x;
-
-        if(x % 100 != 0) {
-            count_inside++;
-            maxPrice = std::max(maxPrice, x);
-            minPrice = std::min(minPrice, x);
-        }
-        else count_outside++;
-    }
     
     uint64_t total_messages_{0};
     uint64_t add_orders_{0};
@@ -122,14 +104,6 @@ private:
                       << std::setw(14) << ask_str << "\n";
         }
         std::cout << "===================================================================\n\n";
-
-        std::cout << "MAX PRICE: " << maxPrice << "\n";
-        std::cout << "MIN PRICE: " << minPrice << "\n";
-        std::cout << "RANGE (inner): " << count_inside << "\n";
-        std::cout << "RANGE (outer): " << count_outside << "\n\n";
-
-        std::cout << "===================================================================\n\n";
-
     }
 
 public:
@@ -233,7 +207,6 @@ public:
                     uint64_t order_id = bswap64(add_msg->order_reference_number);
                     uint32_t shares = bswap32(add_msg->shares);
                     uint32_t price = bswap32(add_msg->price);
-                    check(price);
 
                     order_books_[locate].add_order(order_id, price, shares, add_msg->buy_sell_indicator);
                     add_orders_++;
@@ -245,7 +218,6 @@ public:
                     uint64_t order_id = bswap64(add_msg->order_reference_number);
                     uint32_t shares = bswap32(add_msg->shares);
                     uint32_t price = bswap32(add_msg->price);
-                    check(price);
 
                     order_books_[locate].add_order(order_id, price, shares, add_msg->buy_sell_indicator);
                     add_orders_++;
@@ -288,7 +260,6 @@ public:
                     uint64_t new_id = bswap64(rep_msg->new_order_reference_number);
                     uint32_t shares = bswap32(rep_msg->shares);
                     uint32_t price = bswap32(rep_msg->price);
-                    check(price);
 
                     order_books_[locate].replace_order(old_id, new_id, price, shares);
                     replaced_orders_++;
