@@ -1,0 +1,35 @@
+# CMake & Build Artifacts
+/build/
+bin/
+lib/
+*.o
+*.obj
+*.out
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Generated Executables & Makefiles
+ITCH-PARSER
+Makefile
+CMakeCache.txt
+cmake_install.cmake
+CMakeFiles/
+
+# Large Binary Data & Datasets (ITCH datasets)
+*.bin
+*.gz
+*.csv
+
+# IDE & Editor Settings (VS Code / WSL)
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS Specific Files
+.DS_Store
+Thumbs.db
