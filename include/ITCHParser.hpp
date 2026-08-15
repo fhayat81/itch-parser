@@ -14,12 +14,13 @@
 #include <cstring>
 #include <iomanip>
 #include <memory_resource>
+#include <array>
 
 namespace itch {
 
 class ITCHParser {
 private:
-    // 1. Define 4 GB buffer size (1024 * 1024 * 1024 bytes)
+    // 1. Define 4 GB buffer size (4 * 1024 * 1024 * 1024 bytes)
     static constexpr size_t POOL_SIZE = 4ULL * 1024 * 1024 * 1024;
 
     // Raw pointer for the mmap arena
@@ -40,35 +41,29 @@ private:
     uint64_t cancelled_orders_{0};
     uint64_t replaced_orders_{0};
 
-    // Helper to allocate large memory chunk using huge pages with a fallback
+    // --- Jump Table Typedef and Array ---
+    using MessageHandler = void (ITCHParser::*)(const uint8_t*, uint16_t) noexcept;
+    std::array<MessageHandler, 256> dispatch_table_{};
+
+    // --- Memory Allocation Helper ---
     static void* allocate_arena(size_t size) {
         int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-        
-        // Attempt allocation with huge pages to reduce TLB misses
 #if defined(MAP_HUGETLB)
         void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags | MAP_HUGETLB, -1, 0);
-        if (ptr != MAP_FAILED) {
-            return ptr;
-        }
+        if (ptr != MAP_FAILED) return ptr;
 #endif
-        // Fallback to standard 4KB pages if huge pages aren't configured in the OS
         void* fallback = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
-        if (fallback == MAP_FAILED) {
-            throw std::bad_alloc();
-        }
+        if (fallback == MAP_FAILED) throw std::bad_alloc();
         return fallback;
     }
 
-    // Parse 6-byte big-endian timestamp starting at byte index 5 (nanoseconds since midnight)
+    // --- Utility Methods ---
     static uint64_t parse_itch_timestamp(const uint8_t* ptr) {
         uint64_t raw;
-        // Compilers optimize this into a single 64-bit load (movq)
         std::memcpy(&raw, ptr, sizeof(raw)); 
-        // Swap bytes and drop the extra 2 bytes
         return __builtin_bswap64(raw) >> 16; 
     }
 
-    // Format raw nanoseconds since midnight into HH:MM:SS.nanoseconds
     static std::string format_raw_time(uint64_t nanos) {
         uint64_t total_sec = nanos / 1'000'000'000ULL;
         uint64_t rem_nanos = nanos % 1'000'000'000ULL;
@@ -86,7 +81,6 @@ private:
         return ss.str();
     }
 
-    // Print active order book snapshot for manual locate IDs
     void print_order_book_snapshot(const std::string& label) const {
         std::cout << "\n\n===================================================================\n";
         std::cout << "          ORDER BOOK SNAPSHOT: " << label << "\n";
@@ -99,7 +93,6 @@ private:
                   << std::setw(14) << "BEST ASK" << "\n";
         std::cout << "-------------------------------------------------------------------\n";
 
-        // Hardcoded random locate IDs as requested
         static const std::vector<uint16_t> watchlist_ids = {
             1, 2, 5, 10, 25, 50, 100, 500
         };
@@ -124,6 +117,108 @@ private:
         std::cout << "===================================================================\n\n";
     }
 
+    // --- Message Handlers ---
+
+    inline void handle_ignore(const uint8_t*, uint16_t) noexcept {}
+
+    inline void handle_add_order(const uint8_t* msg_ptr, uint16_t) noexcept {
+        const auto* add_msg = reinterpret_cast<const AddOrderMessage*>(msg_ptr);
+        uint16_t locate = bswap16(add_msg->header.stock_locate);
+        uint64_t order_id = bswap64(add_msg->order_reference_number);
+        uint32_t shares = bswap32(add_msg->shares);
+        uint32_t price = bswap32(add_msg->price);
+
+        order_books_[locate].add_order(order_id, price, shares, add_msg->buy_sell_indicator);
+        add_orders_++;
+    }
+
+    inline void handle_add_order_mpid(const uint8_t* msg_ptr, uint16_t) noexcept {
+        const auto* add_msg = reinterpret_cast<const AddOrderMessage*>(msg_ptr);
+        uint16_t locate = bswap16(add_msg->header.stock_locate);
+        uint64_t order_id = bswap64(add_msg->order_reference_number);
+        uint32_t shares = bswap32(add_msg->shares);
+        uint32_t price = bswap32(add_msg->price);
+
+        order_books_[locate].add_order(order_id, price, shares, add_msg->buy_sell_indicator);
+        add_orders_++;
+    }
+
+    inline void handle_order_executed(const uint8_t* msg_ptr, uint16_t) noexcept {
+        const auto* exec_msg = reinterpret_cast<const OrderExecutedMessage*>(msg_ptr);
+        uint16_t locate = bswap16(exec_msg->header.stock_locate);
+        uint64_t order_id = bswap64(exec_msg->order_reference_number);
+        uint32_t exec_shares = bswap32(exec_msg->executed_shares);
+
+        order_books_[locate].execute_order(order_id, exec_shares);
+        executed_orders_++;
+    }
+
+    inline void handle_order_cancel(const uint8_t* msg_ptr, uint16_t) noexcept {
+        const auto* cancel_msg = reinterpret_cast<const OrderCancelMessage*>(msg_ptr);
+        uint16_t locate = bswap16(cancel_msg->header.stock_locate);
+        uint64_t order_id = bswap64(cancel_msg->order_reference_number);
+        uint32_t cancel_shares = bswap32(cancel_msg->canceled_shares);
+
+        order_books_[locate].cancel_order(order_id, cancel_shares);
+        cancelled_orders_++;
+    }
+
+    inline void handle_order_delete(const uint8_t* msg_ptr, uint16_t) noexcept {
+        const auto* del_msg = reinterpret_cast<const OrderDeleteMessage*>(msg_ptr);
+        uint16_t locate = bswap16(del_msg->header.stock_locate);
+        uint64_t order_id = bswap64(del_msg->order_reference_number);
+
+        order_books_[locate].delete_order(order_id);
+        cancelled_orders_++;
+    }
+
+    inline void handle_order_replace(const uint8_t* msg_ptr, uint16_t) noexcept {
+        const auto* rep_msg = reinterpret_cast<const OrderReplaceMessage*>(msg_ptr);
+        uint16_t locate = bswap16(rep_msg->header.stock_locate);
+        uint64_t old_id = bswap64(rep_msg->original_order_reference_number);
+        uint64_t new_id = bswap64(rep_msg->new_order_reference_number);
+        uint32_t shares = bswap32(rep_msg->shares);
+        uint32_t price = bswap32(rep_msg->price);
+
+        order_books_[locate].replace_order(old_id, new_id, price, shares);
+        replaced_orders_++;
+    }
+
+    inline void handle_stock_directory(const uint8_t* msg_ptr, uint16_t msg_len) noexcept {
+        if (msg_len >= 29) {
+            uint16_t locate = (static_cast<uint16_t>(msg_ptr[1]) << 8) | msg_ptr[2];
+            char sym_buf[9] = {0};
+            std::memcpy(sym_buf, msg_ptr + 11, 8);
+            
+            std::string symbol(sym_buf);
+            symbol.erase(symbol.find_last_not_of(" \n\r\t") + 1);
+
+            if (locate < locate_to_symbol_.size()) {
+                locate_to_symbol_[locate] = symbol;
+            }
+        }
+    }
+
+    inline void handle_system_event(const uint8_t* msg_ptr, uint16_t msg_len) noexcept {
+        if (msg_len >= 12) {
+            uint64_t raw_nanos = parse_itch_timestamp(msg_ptr + 5);
+            char event_code = static_cast<char>(msg_ptr[11]);
+            std::string raw_time = format_raw_time(raw_nanos);
+
+            if (event_code == 'Q') {
+                std::cout << "\n\n[SYSTEM EVENT 'Q'] Start of Market Hours | Timestamp: " 
+                          << raw_time << " (" << raw_nanos << " ns)\n" << std::flush;
+            } else if (event_code == 'M') {
+                std::cout << "\n\n[SYSTEM EVENT 'M'] End of Market Hours | Timestamp: " 
+                          << raw_time << " (" << raw_nanos << " ns)" << std::flush;
+                print_order_book_snapshot("Market Close ('M')");
+            } else if (event_code == 'E') {
+                std::cout << "\n\n[SYSTEM EVENT 'E'] End of System Hours | Timestamp: " 
+                          << raw_time << " (" << raw_nanos << " ns)\n" << std::flush;
+            }
+        }
+    }
+
 public:
     explicit ITCHParser(size_t max_locates = 15000)
         : arena_buffer_(allocate_arena(POOL_SIZE)),
@@ -132,10 +227,23 @@ public:
         order_books_.reserve(max_locates);
         locate_to_symbol_.resize(max_locates);
 
-        // Construct each OrderBook explicitly with a pointer to our PMR pool
         for (size_t i = 0; i < max_locates; ++i) {
             order_books_.emplace_back(&pool_);
         }
+
+        // Initialize jump table with ignore handlers
+        dispatch_table_.fill(&ITCHParser::handle_ignore);
+        
+        // Map specific message types
+        dispatch_table_['A'] = &ITCHParser::handle_add_order;
+        dispatch_table_['F'] = &ITCHParser::handle_add_order_mpid;
+        dispatch_table_['E'] = &ITCHParser::handle_order_executed;
+        dispatch_table_['C'] = &ITCHParser::handle_order_executed;
+        dispatch_table_['X'] = &ITCHParser::handle_order_cancel;
+        dispatch_table_['D'] = &ITCHParser::handle_order_delete;
+        dispatch_table_['U'] = &ITCHParser::handle_order_replace;
+        dispatch_table_['R'] = &ITCHParser::handle_stock_directory;
+        dispatch_table_['S'] = &ITCHParser::handle_system_event;
     }
 
     ~ITCHParser() {
@@ -172,143 +280,22 @@ public:
         #endif
 
         size_t offset = 0;
-        uint32_t progress_counter = 10'000'000; // Counter moved outside loop
+        uint32_t progress_counter = 10'000'000;
 
-        // NASDAQ ITCH binary file format uses 2-byte big-endian framing per message
         while (offset + 2 < filesize) {
-            // Read 2-byte length header prefix
             uint16_t msg_len = (static_cast<uint16_t>(buffer[offset]) << 8) | buffer[offset + 1];
             offset += 2;
 
             if (offset + msg_len > filesize) break;
 
             const uint8_t* msg_ptr = buffer + offset;
-            char msg_type = static_cast<char>(msg_ptr[0]);
-
-            switch (msg_type) {
-                case 'A': [[likely]] { // Add Order (Short Form)
-                    AddOrderMessage add_msg;
-                    std::memcpy(&add_msg, msg_ptr, sizeof(AddOrderMessage));
-                    
-                    uint16_t locate = bswap16(add_msg.header.stock_locate);
-                    uint64_t order_id = bswap64(add_msg.order_reference_number);
-                    uint32_t shares = bswap32(add_msg.shares);
-                    uint32_t price = bswap32(add_msg.price);
-
-                    order_books_[locate].add_order(order_id, price, shares, add_msg.buy_sell_indicator);
-                    add_orders_++;
-                    break;
-                }
-                case 'F': [[likely]] { // Add Order with MPID (Long Form)
-                    AddOrderMessage add_msg; // Structure matches AddOrder short of MPID padding for critical fields
-                    std::memcpy(&add_msg, msg_ptr, sizeof(AddOrderMessage));
-                    
-                    uint16_t locate = bswap16(add_msg.header.stock_locate);
-                    uint64_t order_id = bswap64(add_msg.order_reference_number);
-                    uint32_t shares = bswap32(add_msg.shares);
-                    uint32_t price = bswap32(add_msg.price);
-
-                    order_books_[locate].add_order(order_id, price, shares, add_msg.buy_sell_indicator);
-                    add_orders_++;
-                    break;
-                }
-                case 'E': [[likely]]   // Order Executed
-                case 'C': [[likely]] { // Order Executed with Price
-                    OrderExecutedMessage exec_msg;
-                    std::memcpy(&exec_msg, msg_ptr, sizeof(OrderExecutedMessage));
-                    
-                    uint16_t locate = bswap16(exec_msg.header.stock_locate);
-                    uint64_t order_id = bswap64(exec_msg.order_reference_number);
-                    uint32_t exec_shares = bswap32(exec_msg.executed_shares);
-
-                    order_books_[locate].execute_order(order_id, exec_shares);
-                    executed_orders_++;
-                    break;
-                }
-                case 'X': [[likely]] { // Order Cancel
-                    OrderCancelMessage cancel_msg;
-                    std::memcpy(&cancel_msg, msg_ptr, sizeof(OrderCancelMessage));
-                    
-                    uint16_t locate = bswap16(cancel_msg.header.stock_locate);
-                    uint64_t order_id = bswap64(cancel_msg.order_reference_number);
-                    uint32_t cancel_shares = bswap32(cancel_msg.canceled_shares);
-
-                    order_books_[locate].cancel_order(order_id, cancel_shares);
-                    cancelled_orders_++;
-                    break;
-                }
-                case 'D': [[likely]] { // Order Delete
-                    OrderDeleteMessage del_msg;
-                    std::memcpy(&del_msg, msg_ptr, sizeof(OrderDeleteMessage));
-                    
-                    uint16_t locate = bswap16(del_msg.header.stock_locate);
-                    uint64_t order_id = bswap64(del_msg.order_reference_number);
-
-                    order_books_[locate].delete_order(order_id);
-                    cancelled_orders_++;
-                    break;
-                }
-                case 'U': [[likely]] { // Order Replace
-                    OrderReplaceMessage rep_msg;
-                    std::memcpy(&rep_msg, msg_ptr, sizeof(OrderReplaceMessage));
-                    
-                    uint16_t locate = bswap16(rep_msg.header.stock_locate);
-                    uint64_t old_id = bswap64(rep_msg.original_order_reference_number);
-                    uint64_t new_id = bswap64(rep_msg.new_order_reference_number);
-                    uint32_t shares = bswap32(rep_msg.shares);
-                    uint32_t price = bswap32(rep_msg.price);
-
-                    order_books_[locate].replace_order(old_id, new_id, price, shares);
-                    replaced_orders_++;
-                    break;
-                }
-                case 'R': [[unlikely]] { // Stock Directory (Maps Locate ID to Symbol string)
-                    if (msg_len >= 29) {
-                        uint16_t locate = (static_cast<uint16_t>(msg_ptr[1]) << 8) | msg_ptr[2];
-                        char sym_buf[9] = {0};
-                        std::memcpy(sym_buf, msg_ptr + 11, 8);
-                        
-                        // Trim trailing spaces
-                        std::string symbol(sym_buf);
-                        symbol.erase(symbol.find_last_not_of(" \n\r\t") + 1);
-
-                        if (locate < locate_to_symbol_.size()) {
-                            locate_to_symbol_[locate] = symbol;
-                        }
-                    }
-                    break;
-                }
-                case 'S': [[unlikely]] { // System Event Message
-                    if (msg_len >= 12) {
-                        uint64_t raw_nanos = parse_itch_timestamp(msg_ptr + 5);
-                        char event_code = static_cast<char>(msg_ptr[11]);
-                        std::string raw_time = format_raw_time(raw_nanos);
-
-                        if (event_code == 'Q') { // Start of Market Hours
-                            std::cout << "\n\n[SYSTEM EVENT 'Q'] Start of Market Hours | Timestamp: " 
-                                      << raw_time << " (" << raw_nanos << " ns)\n" << std::flush;
-                        } 
-                        else if (event_code == 'M') { // End of Market Hours
-                            std::cout << "\n\n[SYSTEM EVENT 'M'] End of Market Hours | Timestamp: " 
-                                      << raw_time << " (" << raw_nanos << " ns)" << std::flush;
-                            
-                            // Snapshot active order book right at Market Close
-                            print_order_book_snapshot("Market Close ('M')");
-                        } 
-                        else if (event_code == 'E') { // End of System Hours
-                            std::cout << "\n\n[SYSTEM EVENT 'E'] End of System Hours | Timestamp: " 
-                                      << raw_time << " (" << raw_nanos << " ns)\n" << std::flush;
-                        }
-                    }
-                    break;
-                }
-                default:
-                    break;
-            }
+            
+            // O(1) Jump Table Dispatch
+            uint8_t msg_type = msg_ptr[0];
+            (this->*dispatch_table_[msg_type])(msg_ptr, msg_len);
 
             total_messages_++;
 
-            // Progress reporting optimized out of modulo arithmetic
             if (--progress_counter == 0) {
                 progress_counter = 10'000'000;
                 double pct = (static_cast<double>(offset) / filesize) * 100.0;
