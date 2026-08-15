@@ -15,37 +15,34 @@
 #include <iomanip>
 #include <memory_resource>
 #include <array>
+#include <algorithm>
+#include <x86intrin.h>
 
 namespace itch {
 
 class ITCHParser {
 private:
-    // 1. Define 4 GB buffer size (4 * 1024 * 1024 * 1024 bytes)
     static constexpr size_t POOL_SIZE = 4ULL * 1024 * 1024 * 1024;
 
-    // Raw pointer for the mmap arena
     void* arena_buffer_;
-
-    // PMR Monotonic Buffer Resource wrapping the 4 GB arena
     std::pmr::monotonic_buffer_resource pool_;
 
-    // Order books indexed by locate ID (0..15000)
     std::vector<OrderBook> order_books_;
-
-    // Lookup table
     std::vector<std::string> locate_to_symbol_;
+    
+    // Per-message latency tracking (in CPU cycles)
+    std::vector<uint64_t> latencies_;
     
     uint64_t total_messages_{0};
     uint64_t add_orders_{0};
     uint64_t executed_orders_{0};
     uint64_t cancelled_orders_{0};
     uint64_t replaced_orders_{0};
+    size_t file_size_{0};
 
-    // --- Jump Table Typedef and Array ---
     using MessageHandler = void (ITCHParser::*)(const uint8_t*, uint16_t) noexcept;
     std::array<MessageHandler, 256> dispatch_table_{};
 
-    // --- Memory Allocation Helper ---
     static void* allocate_arena(size_t size) {
         int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #if defined(MAP_HUGETLB)
@@ -55,66 +52,6 @@ private:
         void* fallback = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
         if (fallback == MAP_FAILED) throw std::bad_alloc();
         return fallback;
-    }
-
-    // --- Utility Methods ---
-    static uint64_t parse_itch_timestamp(const uint8_t* ptr) {
-        uint64_t raw;
-        std::memcpy(&raw, ptr, sizeof(raw)); 
-        return __builtin_bswap64(raw) >> 16; 
-    }
-
-    static std::string format_raw_time(uint64_t nanos) {
-        uint64_t total_sec = nanos / 1'000'000'000ULL;
-        uint64_t rem_nanos = nanos % 1'000'000'000ULL;
-        
-        uint32_t hours   = (total_sec / 3600) % 24;
-        uint32_t minutes = (total_sec / 60) % 60;
-        uint32_t seconds = total_sec % 60;
-
-        std::ostringstream ss;
-        ss << std::setfill('0') 
-           << std::setw(2) << hours << ":"
-           << std::setw(2) << minutes << ":"
-           << std::setw(2) << seconds << "."
-           << std::setw(9) << rem_nanos;
-        return ss.str();
-    }
-
-    void print_order_book_snapshot(const std::string& label) const {
-        std::cout << "\n\n===================================================================\n";
-        std::cout << "          ORDER BOOK SNAPSHOT: " << label << "\n";
-        std::cout << "===================================================================\n";
-        std::cout << std::left 
-                  << std::setw(10) << "TICKER"
-                  << std::setw(12) << "LOCATE ID"
-                  << std::setw(16) << "ACTIVE ORDERS"
-                  << std::setw(14) << "BEST BID"
-                  << std::setw(14) << "BEST ASK" << "\n";
-        std::cout << "-------------------------------------------------------------------\n";
-
-        static const std::vector<uint16_t> watchlist_ids = {
-            1, 2, 5, 10, 25, 50, 100, 500
-        };
-
-        for (uint16_t locate : watchlist_ids) {
-            if (locate >= order_books_.size()) continue;
-
-            const auto& book = get_order_book(locate);
-            uint64_t active_orders = book.get_order_count();
-            
-            std::string sym = get_symbol_by_locate(locate);
-            std::string bid_str = (book.best_bid() > 0) ? std::to_string(book.best_bid() / 10000.0) : "N/A";
-            std::string ask_str = (book.best_ask() > 0) ? std::to_string(book.best_ask() / 10000.0) : "N/A";
-
-            std::cout << std::left 
-                      << std::setw(10) << sym
-                      << std::setw(12) << locate
-                      << std::setw(16) << active_orders
-                      << std::setw(14) << bid_str
-                      << std::setw(14) << ask_str << "\n";
-        }
-        std::cout << "===================================================================\n\n";
     }
 
     // --- Message Handlers ---
@@ -199,26 +136,6 @@ private:
         }
     }
 
-    inline void handle_system_event(const uint8_t* msg_ptr, uint16_t msg_len) noexcept {
-        if (msg_len >= 12) {
-            uint64_t raw_nanos = parse_itch_timestamp(msg_ptr + 5);
-            char event_code = static_cast<char>(msg_ptr[11]);
-            std::string raw_time = format_raw_time(raw_nanos);
-
-            if (event_code == 'Q') {
-                std::cout << "\n\n[SYSTEM EVENT 'Q'] Start of Market Hours | Timestamp: " 
-                          << raw_time << " (" << raw_nanos << " ns)\n" << std::flush;
-            } else if (event_code == 'M') {
-                std::cout << "\n\n[SYSTEM EVENT 'M'] End of Market Hours | Timestamp: " 
-                          << raw_time << " (" << raw_nanos << " ns)" << std::flush;
-                print_order_book_snapshot("Market Close ('M')");
-            } else if (event_code == 'E') {
-                std::cout << "\n\n[SYSTEM EVENT 'E'] End of System Hours | Timestamp: " 
-                          << raw_time << " (" << raw_nanos << " ns)\n" << std::flush;
-            }
-        }
-    }
-
 public:
     explicit ITCHParser(size_t max_locates = 15000)
         : arena_buffer_(allocate_arena(POOL_SIZE)),
@@ -226,15 +143,16 @@ public:
         
         order_books_.reserve(max_locates);
         locate_to_symbol_.resize(max_locates);
+        
+        // Pre-allocate storage for 400M latency entries to avoid reallocations
+        latencies_.reserve(400'000'000);
 
         for (size_t i = 0; i < max_locates; ++i) {
             order_books_.emplace_back(&pool_);
         }
 
-        // Initialize jump table with ignore handlers
         dispatch_table_.fill(&ITCHParser::handle_ignore);
         
-        // Map specific message types
         dispatch_table_['A'] = &ITCHParser::handle_add_order;
         dispatch_table_['F'] = &ITCHParser::handle_add_order_mpid;
         dispatch_table_['E'] = &ITCHParser::handle_order_executed;
@@ -243,7 +161,6 @@ public:
         dispatch_table_['D'] = &ITCHParser::handle_order_delete;
         dispatch_table_['U'] = &ITCHParser::handle_order_replace;
         dispatch_table_['R'] = &ITCHParser::handle_stock_directory;
-        dispatch_table_['S'] = &ITCHParser::handle_system_event;
     }
 
     ~ITCHParser() {
@@ -266,6 +183,7 @@ public:
         }
 
         size_t filesize = sb.st_size;
+        file_size_ = filesize;
         auto* buffer = static_cast<const uint8_t*>(
             mmap(nullptr, filesize, PROT_READ, MAP_PRIVATE, fd, 0)
         );
@@ -280,7 +198,6 @@ public:
         #endif
 
         size_t offset = 0;
-        uint32_t progress_counter = 10'000'000;
 
         while (offset + 2 < filesize) {
             uint16_t msg_len = (static_cast<uint16_t>(buffer[offset]) << 8) | buffer[offset + 1];
@@ -289,30 +206,60 @@ public:
             if (offset + msg_len > filesize) break;
 
             const uint8_t* msg_ptr = buffer + offset;
-            
-            // O(1) Jump Table Dispatch
             uint8_t msg_type = msg_ptr[0];
+            
+            // Per-message benchmarking
+            uint64_t start_cycles = __rdtsc();
             (this->*dispatch_table_[msg_type])(msg_ptr, msg_len);
+            uint64_t end_cycles = __rdtsc();
 
+            latencies_.push_back(end_cycles - start_cycles);
             total_messages_++;
-
-            if (--progress_counter == 0) {
-                progress_counter = 10'000'000;
-                double pct = (static_cast<double>(offset) / filesize) * 100.0;
-                std::cout << "\r[Processing] " << (total_messages_ / 1'000'000) 
-                          << "M messages | " << std::fixed << std::setprecision(1) 
-                          << pct << "% complete" << std::flush;
-            }
-
             offset += msg_len;
         }
-
-        std::cout << "\r[Complete] Processed " << total_messages_ 
-                  << " total messages (100.0%).        \n" << std::flush;
 
         munmap(const_cast<uint8_t*>(buffer), filesize);
         close(fd);
         return true;
+    }
+
+    void print_latency_metrics() {
+        if (latencies_.empty()) return;
+
+        size_t n = latencies_.size();
+        size_t p50_index = n * 0.50;
+        size_t p99_index = n * 0.99;
+        size_t p999_index = n * 0.999;
+
+        // Calculate Average
+        uint64_t total_cycles = 0;
+        for (uint64_t cycles : latencies_) {
+            total_cycles += cycles;
+        }
+        uint64_t avg_cycles = total_cycles / n;
+
+        // Calculate Percentiles
+        std::nth_element(latencies_.begin(), latencies_.begin() + p50_index, latencies_.end());
+        uint64_t p50 = latencies_[p50_index];
+
+        std::nth_element(latencies_.begin(), latencies_.begin() + p99_index, latencies_.end());
+        uint64_t p99 = latencies_[p99_index];
+
+        std::nth_element(latencies_.begin(), latencies_.begin() + p999_index, latencies_.end());
+        uint64_t p999 = latencies_[p999_index];
+
+        auto max_it = std::max_element(latencies_.begin(), latencies_.end());
+        uint64_t max_cycles = *max_it;
+
+        std::cout << "\n========================================\n";
+        std::cout << "    TAIL LATENCY METRICS (CPU Cycles)     \n";
+        std::cout << "========================================\n";
+        std::cout << std::left << std::setw(15) << "Average"      << ": " << avg_cycles << " cycles\n";
+        std::cout << std::left << std::setw(15) << "p50 (Median)" << ": " << p50 << " cycles\n";
+        std::cout << std::left << std::setw(15) << "p99"          << ": " << p99 << " cycles\n";
+        std::cout << std::left << std::setw(15) << "p99.9"        << ": " << p999 << " cycles\n";
+        std::cout << std::left << std::setw(15) << "Maximum"      << ": " << max_cycles << " cycles\n";
+        std::cout << "========================================\n\n";
     }
 
     std::string get_symbol_by_locate(uint16_t locate_id) const {
@@ -331,6 +278,7 @@ public:
     [[nodiscard]] uint64_t executed_orders() const noexcept { return executed_orders_; }
     [[nodiscard]] uint64_t cancelled_orders() const noexcept { return cancelled_orders_; }
     [[nodiscard]] uint64_t replaced_orders() const noexcept { return replaced_orders_; }
+    [[nodiscard]] size_t file_size() const noexcept { return file_size_; }
 };
 
 } // namespace itch

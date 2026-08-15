@@ -20,6 +20,14 @@ int main(int argc, char* argv[]) {
     if (!success) return 1;
 
     std::chrono::duration<double, std::milli> duration = end - start;
+    
+    // --- Throughput Calculations ---
+    double seconds = duration.count() / 1000.0;
+    double file_size_mb = parser.file_size() / (1024.0 * 1024.0);
+    
+    double msgs_per_sec = parser.total_messages() / seconds;
+    double mb_per_sec = file_size_mb / seconds;
+    double avg_latency_ns = (seconds * 1'000'000'000.0) / parser.total_messages();
 
     std::cout << "\n========================================\n";
     std::cout << "   NASDAQ ITCH 5.0 Feed Handler Engine   \n";
@@ -29,9 +37,14 @@ int main(int argc, char* argv[]) {
     std::cout << "Executions ('E'/'C'):   " << parser.executed_orders() << "\n";
     std::cout << "Cancels/Deletes ('X/D'):" << parser.cancelled_orders() << "\n";
     std::cout << "Replaces ('U'):        " << parser.replaced_orders() << "\n";
-    std::cout << "Processing Time:        " << duration.count() << " ms\n";
-    std::cout << "========================================\n\n";
+    std::cout << "----------------------------------------\n";
+    std::cout << "Processing Time:        " << std::fixed << std::setprecision(2) << duration.count() << " ms\n";
+    std::cout << "Message Throughput:     " << std::fixed << std::setprecision(2) << (msgs_per_sec / 1'000'000.0) << " Million msgs/sec\n";
+    std::cout << "Data Throughput:        " << std::fixed << std::setprecision(2) << mb_per_sec << " MB/sec\n";
+    std::cout << "Avg Latency (Wall):     " << std::fixed << std::setprecision(2) << avg_latency_ns << " ns / msg\n";
+    std::cout << "========================================\n";
 
+    parser.print_latency_metrics();
 
     return 0;
 }
