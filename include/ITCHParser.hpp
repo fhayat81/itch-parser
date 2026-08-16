@@ -16,6 +16,7 @@
 #include <memory_resource>
 #include <array>
 #include <algorithm>
+#include <chrono> // Added for nanosecond latency tracking
 #include <x86intrin.h>
 
 namespace itch {
@@ -30,7 +31,7 @@ private:
     std::vector<OrderBook> order_books_;
     std::vector<std::string> locate_to_symbol_;
     
-    // Per-message latency tracking (in CPU cycles)
+    // Per-message latency tracking (in nanoseconds)
     std::vector<uint64_t> latencies_;
     
     uint64_t total_messages_{0};
@@ -208,12 +209,14 @@ public:
             const uint8_t* msg_ptr = buffer + offset;
             uint8_t msg_type = msg_ptr[0];
             
-            // Per-message benchmarking
-            uint64_t start_cycles = __rdtsc();
+            // Replaced __rdtsc() with std::chrono for nanosecond timing
+            auto start_ns = std::chrono::steady_clock::now();
             (this->*dispatch_table_[msg_type])(msg_ptr, msg_len);
-            uint64_t end_cycles = __rdtsc();
+            auto end_ns = std::chrono::steady_clock::now();
 
-            latencies_.push_back(end_cycles - start_cycles);
+            uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_ns - start_ns).count();
+            latencies_.push_back(duration_ns);
+
             total_messages_++;
             offset += msg_len;
         }
@@ -232,11 +235,11 @@ public:
         size_t p999_index = n * 0.999;
 
         // Calculate Average
-        uint64_t total_cycles = 0;
-        for (uint64_t cycles : latencies_) {
-            total_cycles += cycles;
+        uint64_t total_ns = 0;
+        for (uint64_t ns : latencies_) {
+            total_ns += ns;
         }
-        uint64_t avg_cycles = total_cycles / n;
+        uint64_t avg_ns = total_ns / n;
 
         // Calculate Percentiles
         std::nth_element(latencies_.begin(), latencies_.begin() + p50_index, latencies_.end());
@@ -249,16 +252,16 @@ public:
         uint64_t p999 = latencies_[p999_index];
 
         auto max_it = std::max_element(latencies_.begin(), latencies_.end());
-        uint64_t max_cycles = *max_it;
+        uint64_t max_ns = *max_it;
 
         std::cout << "\n========================================\n";
-        std::cout << "    TAIL LATENCY METRICS (CPU Cycles)     \n";
+        std::cout << "    TAIL LATENCY METRICS (Nanoseconds)    \n";
         std::cout << "========================================\n";
-        std::cout << std::left << std::setw(15) << "Average"      << ": " << avg_cycles << " cycles\n";
-        std::cout << std::left << std::setw(15) << "p50 (Median)" << ": " << p50 << " cycles\n";
-        std::cout << std::left << std::setw(15) << "p99"          << ": " << p99 << " cycles\n";
-        std::cout << std::left << std::setw(15) << "p99.9"        << ": " << p999 << " cycles\n";
-        std::cout << std::left << std::setw(15) << "Maximum"      << ": " << max_cycles << " cycles\n";
+        std::cout << std::left << std::setw(15) << "Average"      << ": " << avg_ns << " ns\n";
+        std::cout << std::left << std::setw(15) << "p50 (Median)" << ": " << p50 << " ns\n";
+        std::cout << std::left << std::setw(15) << "p99"          << ": " << p99 << " ns\n";
+        std::cout << std::left << std::setw(15) << "p99.9"        << ": " << p999 << " ns\n";
+        std::cout << std::left << std::setw(15) << "Maximum"      << ": " << max_ns << " ns\n";
         std::cout << "========================================\n\n";
     }
 
