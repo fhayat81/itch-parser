@@ -23,7 +23,7 @@ namespace itch {
 
 class ITCHParser {
 private:
-    static constexpr size_t POOL_SIZE = 4ULL * 1024 * 1024 * 1024;
+    static constexpr size_t POOL_SIZE = 5ULL * 1024 * 1024 * 1024;
 
     void* arena_buffer_;
     std::pmr::monotonic_buffer_resource pool_;
@@ -31,8 +31,10 @@ private:
     std::vector<OrderBook> order_books_;
     std::vector<std::string> locate_to_symbol_;
     
-    // Per-message latency tracking
-    std::vector<uint64_t> latencies_;
+    // O(1) Bucket Histogram for Latency Tracking (up to 100,000 ns)
+    std::array<uint64_t, 100000> latency_buckets_{};
+    uint64_t latency_overflow_{0};
+    uint64_t max_latency_ns_{0};
     
     uint64_t total_messages_{0};
     uint64_t add_orders_{0};
@@ -162,12 +164,10 @@ public:
           pool_(arena_buffer_, POOL_SIZE, std::pmr::null_memory_resource()) {
           
         calibrate_tsc();
+        latency_buckets_.fill(0);
         
         order_books_.reserve(max_locates);
         locate_to_symbol_.resize(max_locates);
-        
-        // Pre-allocate storage for 400M latency entries to avoid reallocations
-        latencies_.reserve(400'000'000);
 
         for (size_t i = 0; i < max_locates; ++i) {
             order_books_.emplace_back(&pool_);
@@ -230,12 +230,23 @@ public:
             const uint8_t* msg_ptr = buffer + offset;
             uint8_t msg_type = msg_ptr[0];
             
-            // Reverted to fast __rdtsc() intrinsic for benchmarking
+            // Fast __rdtsc() intrinsic for benchmarking
             uint64_t start_cycles = __rdtsc();
             (this->*dispatch_table_[msg_type])(msg_ptr, msg_len);
             uint64_t end_cycles = __rdtsc();
 
-            latencies_.push_back(end_cycles - start_cycles);
+            // Convert to ns and bucket in O(1)
+            uint64_t duration_ns = static_cast<uint64_t>((end_cycles - start_cycles) * cycles_to_ns_multiplier_);
+            
+            if (duration_ns > max_latency_ns_) {
+                max_latency_ns_ = duration_ns;
+            }
+
+            if (duration_ns < latency_buckets_.size()) {
+                latency_buckets_[duration_ns]++;
+            } else {
+                latency_overflow_++;
+            }
 
             total_messages_++;
             offset += msg_len;
@@ -246,42 +257,37 @@ public:
         return true;
     }
 
-    void print_latency_metrics() {
-        if (latencies_.empty()) return;
+    void print_latency_metrics() const {
+        if (total_messages_ == 0) return;
 
-        size_t n = latencies_.size();
-        size_t p50_index = n * 0.50;
-        size_t p99_index = n * 0.99;
-        size_t p999_index = n * 0.999;
-
-        // Calculate Average
-        uint64_t total_cycles = 0;
-        for (uint64_t cycles : latencies_) {
-            total_cycles += cycles;
+        uint64_t sum_ns = 0;
+        for (size_t i = 0; i < latency_buckets_.size(); ++i) {
+            sum_ns += (i * latency_buckets_[i]);
         }
-        uint64_t avg_cycles = total_cycles / n;
+        uint64_t avg_ns = sum_ns / total_messages_;
 
-        // Calculate Percentiles
-        std::nth_element(latencies_.begin(), latencies_.begin() + p50_index, latencies_.end());
-        uint64_t p50_cycles = latencies_[p50_index];
-
-        std::nth_element(latencies_.begin(), latencies_.begin() + p99_index, latencies_.end());
-        uint64_t p99_cycles = latencies_[p99_index];
-
-        std::nth_element(latencies_.begin(), latencies_.begin() + p999_index, latencies_.end());
-        uint64_t p999_cycles = latencies_[p999_index];
-
-        auto max_it = std::max_element(latencies_.begin(), latencies_.end());
-        uint64_t max_cycles = *max_it;
+        auto get_percentile = [&](double p) -> uint64_t {
+            uint64_t threshold = static_cast<uint64_t>(total_messages_ * (p / 100.0));
+            uint64_t current = 0;
+            for (size_t i = 0; i < latency_buckets_.size(); ++i) {
+                current += latency_buckets_[i];
+                if (current >= threshold) return i;
+            }
+            return latency_buckets_.size(); // Reached overflow threshold
+        };
 
         std::cout << "\n========================================\n";
         std::cout << "    TAIL LATENCY METRICS (Nanoseconds)    \n";
         std::cout << "========================================\n";
-        std::cout << std::left << std::setw(15) << "Average"      << ": " << static_cast<uint64_t>(avg_cycles * cycles_to_ns_multiplier_) << " ns\n";
-        std::cout << std::left << std::setw(15) << "p50 (Median)" << ": " << static_cast<uint64_t>(p50_cycles * cycles_to_ns_multiplier_) << " ns\n";
-        std::cout << std::left << std::setw(15) << "p99"          << ": " << static_cast<uint64_t>(p99_cycles * cycles_to_ns_multiplier_) << " ns\n";
-        std::cout << std::left << std::setw(15) << "p99.9"        << ": " << static_cast<uint64_t>(p999_cycles * cycles_to_ns_multiplier_) << " ns\n";
-        std::cout << std::left << std::setw(15) << "Maximum"      << ": " << static_cast<uint64_t>(max_cycles * cycles_to_ns_multiplier_) << " ns\n";
+        std::cout << std::left << std::setw(15) << "Average"      << ": " << avg_ns << " ns\n";
+        std::cout << std::left << std::setw(15) << "p50 (Median)" << ": " << get_percentile(50.0) << " ns\n";
+        std::cout << std::left << std::setw(15) << "p99"          << ": " << get_percentile(99.0) << " ns\n";
+        std::cout << std::left << std::setw(15) << "p99.9"        << ": " << get_percentile(99.9) << " ns\n";
+        std::cout << std::left << std::setw(15) << "Maximum"      << ": " << max_latency_ns_ << " ns\n";
+        
+        if (latency_overflow_ > 0) {
+            std::cout << std::left << std::setw(15) << "Overflows"    << ": " << latency_overflow_ << " (>100us)\n";
+        }
         std::cout << "========================================\n\n";
     }
 

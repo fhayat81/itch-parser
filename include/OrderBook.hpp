@@ -7,13 +7,18 @@
 #include "DenseMap.hpp"
 
 namespace itch {
+    
+struct PriceLevel;
 
-// Packed to fit cleanly into cache lines (16 bytes aligned)
-struct alignas(8) OrderMetaData {
+// Packed to fit cleanly into cache lines (32 bytes aligned)
+struct alignas(32) OrderMetaData {
     uint64_t order_id;
     uint32_t price;
     uint32_t shares;
     char side; // 'B' for Buy, 'S' for Sell
+    
+    // NEW: Stable pointer directly into the std::map's node memory
+    PriceLevel* level_ptr; 
 };
 
 struct PriceLevel {
@@ -43,17 +48,31 @@ public:
     OrderBook& operator=(OrderBook&&) noexcept = default;
 
     inline void add_order(uint64_t order_id, uint32_t price, uint32_t shares, char side) noexcept {
-        order_map_.insert(order_id, OrderMetaData{order_id, price, shares, side});
-        
+        PriceLevel* level_ptr = nullptr;
+
         if (side == 'B') {
-            auto& level = bids_[price];
-            level.volume += shares;
-            level.order_count++;
+            // Find or insert the price level
+            auto it = bids_.find(price);
+            if (it == bids_.end()) {
+                it = bids_.emplace(price, PriceLevel{0, 0}).first;
+            }
+            it->second.volume += shares;
+            it->second.order_count++;
+            
+            // Capture the stable memory address
+            level_ptr = &(it->second);
         } else {
-            auto& level = asks_[price];
-            level.volume += shares;
-            level.order_count++;
+            auto it = asks_.find(price);
+            if (it == asks_.end()) {
+                it = asks_.emplace(price, PriceLevel{0, 0}).first;
+            }
+            it->second.volume += shares;
+            it->second.order_count++;
+            
+            level_ptr = &(it->second);
         }
+
+        order_map_.insert(order_id, OrderMetaData{order_id, price, shares, side, level_ptr});
     }
 
     inline void execute_order(uint64_t order_id, uint32_t executed_shares) noexcept {
@@ -63,10 +82,17 @@ public:
         uint32_t actual_exec = std::min(executed_shares, order->shares);
         order->shares -= actual_exec;
         
-        const bool fully_filled = (order->shares == 0);
-        reduce_level(order->side, order->price, actual_exec, fully_filled);
+        // O(1) Volume Deduction directly inside the std::map!
+        order->level_ptr->volume -= actual_exec;
 
-        if (fully_filled) {
+        if (order->shares == 0) {
+            order->level_ptr->order_count--;
+            
+            // Only perform O(log N) tree operation if the price level is dead
+            if (order->level_ptr->order_count == 0) {
+                if (order->side == 'B') bids_.erase(order->price);
+                else asks_.erase(order->price);
+            }
             order_map_.erase(order_id);
         }
     }
@@ -79,8 +105,15 @@ public:
         OrderMetaData* order = order_map_.find(order_id);
         if (!order) [[unlikely]] return;
 
-        // Deleting an order always removes it fully from the price level
-        reduce_level(order->side, order->price, order->shares, true);
+        // O(1) Deduction
+        order->level_ptr->volume -= order->shares;
+        order->level_ptr->order_count--;
+
+        // Only erase from the map if it's completely empty
+        if (order->level_ptr->order_count == 0) {
+            if (order->side == 'B') bids_.erase(order->price);
+            else asks_.erase(order->price);
+        }
         order_map_.erase(order_id);
     }
 
@@ -103,37 +136,6 @@ public:
 
     [[nodiscard]] inline size_t get_order_count() const noexcept {
         return order_map_.size();
-    }
-
-private:
-    inline void reduce_level(char side, uint32_t price, uint32_t qty, bool fully_removed) noexcept {
-        if (side == 'B') {
-            auto it = bids_.find(price);
-            if (it != bids_.end()) [[likely]] {
-                if (fully_removed && it->second.order_count > 0) {
-                    it->second.order_count--;
-                }
-                
-                if (it->second.volume > qty && it->second.order_count > 0) {
-                    it->second.volume -= qty;
-                } else {
-                    bids_.erase(it); // Erase price level when volume or order count hits 0
-                }
-            }
-        } else {
-            auto it = asks_.find(price);
-            if (it != asks_.end()) [[likely]] {
-                if (fully_removed && it->second.order_count > 0) {
-                    it->second.order_count--;
-                }
-
-                if (it->second.volume > qty && it->second.order_count > 0) {
-                    it->second.volume -= qty;
-                } else {
-                    asks_.erase(it); // Erase price level when volume or order count hits 0
-                }
-            }
-        }
     }
 };
 
