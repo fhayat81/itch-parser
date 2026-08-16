@@ -16,7 +16,7 @@
 #include <memory_resource>
 #include <array>
 #include <algorithm>
-#include <chrono> // Added for nanosecond latency tracking
+#include <chrono> 
 #include <x86intrin.h>
 
 namespace itch {
@@ -31,7 +31,7 @@ private:
     std::vector<OrderBook> order_books_;
     std::vector<std::string> locate_to_symbol_;
     
-    // Per-message latency tracking (in nanoseconds)
+    // Per-message latency tracking
     std::vector<uint64_t> latencies_;
     
     uint64_t total_messages_{0};
@@ -40,6 +40,9 @@ private:
     uint64_t cancelled_orders_{0};
     uint64_t replaced_orders_{0};
     size_t file_size_{0};
+    
+    // Multiplier to convert TSC cycles to nanoseconds
+    double cycles_to_ns_multiplier_{0.0};
 
     using MessageHandler = void (ITCHParser::*)(const uint8_t*, uint16_t) noexcept;
     std::array<MessageHandler, 256> dispatch_table_{};
@@ -53,6 +56,22 @@ private:
         void* fallback = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
         if (fallback == MAP_FAILED) throw std::bad_alloc();
         return fallback;
+    }
+    
+    // Calibrates the CPU's Time Stamp Counter to calculate the nanosecond multiplier
+    void calibrate_tsc() {
+        auto t0 = std::chrono::steady_clock::now();
+        uint64_t c0 = __rdtsc();
+        
+        // Spin wait for roughly 10 milliseconds
+        while (std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count() < 10) {}
+            
+        uint64_t c1 = __rdtsc();
+        auto t1 = std::chrono::steady_clock::now();
+        
+        double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        cycles_to_ns_multiplier_ = elapsed_ns / (c1 - c0);
     }
 
     // --- Message Handlers ---
@@ -141,6 +160,8 @@ public:
     explicit ITCHParser(size_t max_locates = 15000)
         : arena_buffer_(allocate_arena(POOL_SIZE)),
           pool_(arena_buffer_, POOL_SIZE, std::pmr::null_memory_resource()) {
+          
+        calibrate_tsc();
         
         order_books_.reserve(max_locates);
         locate_to_symbol_.resize(max_locates);
@@ -209,13 +230,12 @@ public:
             const uint8_t* msg_ptr = buffer + offset;
             uint8_t msg_type = msg_ptr[0];
             
-            // Replaced __rdtsc() with std::chrono for nanosecond timing
-            auto start_ns = std::chrono::steady_clock::now();
+            // Reverted to fast __rdtsc() intrinsic for benchmarking
+            uint64_t start_cycles = __rdtsc();
             (this->*dispatch_table_[msg_type])(msg_ptr, msg_len);
-            auto end_ns = std::chrono::steady_clock::now();
+            uint64_t end_cycles = __rdtsc();
 
-            uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_ns - start_ns).count();
-            latencies_.push_back(duration_ns);
+            latencies_.push_back(end_cycles - start_cycles);
 
             total_messages_++;
             offset += msg_len;
@@ -235,33 +255,33 @@ public:
         size_t p999_index = n * 0.999;
 
         // Calculate Average
-        uint64_t total_ns = 0;
-        for (uint64_t ns : latencies_) {
-            total_ns += ns;
+        uint64_t total_cycles = 0;
+        for (uint64_t cycles : latencies_) {
+            total_cycles += cycles;
         }
-        uint64_t avg_ns = total_ns / n;
+        uint64_t avg_cycles = total_cycles / n;
 
         // Calculate Percentiles
         std::nth_element(latencies_.begin(), latencies_.begin() + p50_index, latencies_.end());
-        uint64_t p50 = latencies_[p50_index];
+        uint64_t p50_cycles = latencies_[p50_index];
 
         std::nth_element(latencies_.begin(), latencies_.begin() + p99_index, latencies_.end());
-        uint64_t p99 = latencies_[p99_index];
+        uint64_t p99_cycles = latencies_[p99_index];
 
         std::nth_element(latencies_.begin(), latencies_.begin() + p999_index, latencies_.end());
-        uint64_t p999 = latencies_[p999_index];
+        uint64_t p999_cycles = latencies_[p999_index];
 
         auto max_it = std::max_element(latencies_.begin(), latencies_.end());
-        uint64_t max_ns = *max_it;
+        uint64_t max_cycles = *max_it;
 
         std::cout << "\n========================================\n";
         std::cout << "    TAIL LATENCY METRICS (Nanoseconds)    \n";
         std::cout << "========================================\n";
-        std::cout << std::left << std::setw(15) << "Average"      << ": " << avg_ns << " ns\n";
-        std::cout << std::left << std::setw(15) << "p50 (Median)" << ": " << p50 << " ns\n";
-        std::cout << std::left << std::setw(15) << "p99"          << ": " << p99 << " ns\n";
-        std::cout << std::left << std::setw(15) << "p99.9"        << ": " << p999 << " ns\n";
-        std::cout << std::left << std::setw(15) << "Maximum"      << ": " << max_ns << " ns\n";
+        std::cout << std::left << std::setw(15) << "Average"      << ": " << static_cast<uint64_t>(avg_cycles * cycles_to_ns_multiplier_) << " ns\n";
+        std::cout << std::left << std::setw(15) << "p50 (Median)" << ": " << static_cast<uint64_t>(p50_cycles * cycles_to_ns_multiplier_) << " ns\n";
+        std::cout << std::left << std::setw(15) << "p99"          << ": " << static_cast<uint64_t>(p99_cycles * cycles_to_ns_multiplier_) << " ns\n";
+        std::cout << std::left << std::setw(15) << "p99.9"        << ": " << static_cast<uint64_t>(p999_cycles * cycles_to_ns_multiplier_) << " ns\n";
+        std::cout << std::left << std::setw(15) << "Maximum"      << ": " << static_cast<uint64_t>(max_cycles * cycles_to_ns_multiplier_) << " ns\n";
         std::cout << "========================================\n\n";
     }
 
