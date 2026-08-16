@@ -3,6 +3,7 @@
 #include "ITCHStructs.hpp"
 #include "ByteUtils.hpp"
 #include "OrderBook.hpp"
+#include "MemoryPool.hpp"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -23,14 +24,19 @@ namespace itch {
 class ITCHParser {
 private:
     static constexpr size_t POOL_SIZE = 4ULL * 1024 * 1024 * 1024;
+    static constexpr size_t MAX_ACTIVE_ORDERS = 10'000'000;
+    static constexpr size_t MAX_ACTIVE_LEVELS = 1'000'000;
 
     void* arena_buffer_;
-    std::pmr::monotonic_buffer_resource pool_;
+    std::pmr::monotonic_buffer_resource pmr_pool_; // Reserved for DenseMap vectors
+
+    // Zero-allocation shared free lists
+    MemoryPool<OrderNode> order_pool_;
+    MemoryPool<PriceLevel> level_pool_;
 
     std::vector<OrderBook> order_books_;
     std::vector<std::string> locate_to_symbol_;
     
-    // Per-message latency tracking (in CPU cycles)
     std::vector<uint64_t> latencies_;
     
     uint64_t total_messages_{0};
@@ -53,8 +59,6 @@ private:
         if (fallback == MAP_FAILED) throw std::bad_alloc();
         return fallback;
     }
-
-    // --- Message Handlers ---
 
     inline void handle_ignore(const uint8_t*, uint16_t) noexcept {}
 
@@ -139,16 +143,16 @@ private:
 public:
     explicit ITCHParser(size_t max_locates = 15000)
         : arena_buffer_(allocate_arena(POOL_SIZE)),
-          pool_(arena_buffer_, POOL_SIZE, std::pmr::null_memory_resource()) {
+          pmr_pool_(arena_buffer_, POOL_SIZE, std::pmr::null_memory_resource()),
+          order_pool_(MAX_ACTIVE_ORDERS),
+          level_pool_(MAX_ACTIVE_LEVELS) {
         
         order_books_.reserve(max_locates);
         locate_to_symbol_.resize(max_locates);
-        
-        // Pre-allocate storage for 400M latency entries to avoid reallocations
         latencies_.reserve(400'000'000);
 
         for (size_t i = 0; i < max_locates; ++i) {
-            order_books_.emplace_back(&pool_);
+            order_books_.emplace_back(&order_pool_, &level_pool_, &pmr_pool_);
         }
 
         dispatch_table_.fill(&ITCHParser::handle_ignore);
@@ -208,7 +212,6 @@ public:
             const uint8_t* msg_ptr = buffer + offset;
             uint8_t msg_type = msg_ptr[0];
             
-            // Per-message benchmarking
             uint64_t start_cycles = __rdtsc();
             (this->*dispatch_table_[msg_type])(msg_ptr, msg_len);
             uint64_t end_cycles = __rdtsc();
@@ -231,14 +234,12 @@ public:
         size_t p99_index = n * 0.99;
         size_t p999_index = n * 0.999;
 
-        // Calculate Average
         uint64_t total_cycles = 0;
         for (uint64_t cycles : latencies_) {
             total_cycles += cycles;
         }
         uint64_t avg_cycles = total_cycles / n;
 
-        // Calculate Percentiles
         std::nth_element(latencies_.begin(), latencies_.begin() + p50_index, latencies_.end());
         uint64_t p50 = latencies_[p50_index];
 
