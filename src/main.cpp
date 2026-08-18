@@ -1,7 +1,5 @@
 #include <iostream>
 #include <iomanip>
-#include <vector>
-#include <string>
 #include <chrono>
 #include "ITCHParser.hpp"
 
@@ -20,23 +18,24 @@ int main(int argc, char* argv[]) {
     if (!success) return 1;
 
     std::chrono::duration<double, std::milli> duration = end - start;
-    
-    // --- Throughput Calculations ---
+
     double seconds = duration.count() / 1000.0;
     double file_size_mb = parser.file_size() / (1024.0 * 1024.0);
-    
-    double msgs_per_sec = parser.total_messages() / seconds;
+
+    uint64_t total_msgs = parser.total_messages_count();
+    double msgs_per_sec = total_msgs / seconds;
     double mb_per_sec = file_size_mb / seconds;
-    double avg_latency_ns = (seconds * 1'000'000'000.0) / parser.total_messages();
+    double avg_latency_ns = (seconds * 1'000'000'000.0) / total_msgs;
 
     std::cout << "\n========================================\n";
-    std::cout << "   NASDAQ ITCH 5.0 Feed Handler Engine   \n";
+    std::cout << "   NASDAQ ITCH 5.0 Multithreaded Engine \n";
+    std::cout << "   Producer Core: 3 | Consumer Cores: 5, 7, 9\n";
     std::cout << "========================================\n";
-    std::cout << "Total Messages Scanned: " << parser.total_messages() << "\n";
-    std::cout << "Add Orders ('A'/'F'):   " << parser.add_orders() << "\n";
-    std::cout << "Executions ('E'/'C'):   " << parser.executed_orders() << "\n";
-    std::cout << "Cancels/Deletes ('X/D'):" << parser.cancelled_orders() << "\n";
-    std::cout << "Replaces ('U'):        " << parser.replaced_orders() << "\n";
+    std::cout << "Total Messages Scanned: " << total_msgs << "\n";
+    std::cout << "Add Orders ('A'/'F'):   " << parser.add_orders_count() << "\n";
+    std::cout << "Executions ('E'/'C'):   " << parser.executed_orders_count() << "\n";
+    std::cout << "Cancels/Deletes ('X/D'):" << parser.cancelled_orders_count() << "\n";
+    std::cout << "Replaces ('U'):         " << parser.replaced_orders_count() << "\n";
     std::cout << "----------------------------------------\n";
     std::cout << "Processing Time:        " << std::fixed << std::setprecision(2) << duration.count() << " ms\n";
     std::cout << "Message Throughput:     " << std::fixed << std::setprecision(2) << (msgs_per_sec / 1'000'000.0) << " Million msgs/sec\n";
